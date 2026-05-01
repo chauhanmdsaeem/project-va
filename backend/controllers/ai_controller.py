@@ -1,8 +1,9 @@
 import os
+import requests
 
 from flask import request
 from flask_jwt_extended import get_jwt_identity, jwt_required
-from openai import OpenAI
+from groq import Groq
 
 from controllers.file_analyzer import extract_text_from_file
 from utils.helpers import parse_object_id, resp
@@ -17,16 +18,57 @@ CONTEXTUAL_STUDY_ASSISTANT_PROMPT = (
 )
 
 
-def get_ai_client():
-    api_key = os.getenv('OPENAI_API_KEY', '').strip()
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+# --- New AI Generation Logic (Groq + Ollama) ---
+
+def generate_ai_completion(messages, max_tokens=500, temperature=0.7, use_local=False):
+    """
+    Handles AI generation switching between Groq (Cloud) and Ollama (Local).
+    """
+    if use_local:
+        # Use Local Ollama
+        ollama_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434').strip()
+        ollama_model = os.getenv('OLLAMA_MODEL', 'llama3').strip()
+        
+        try:
+            response = requests.post(
+                f"{ollama_url}/api/chat",
+                json={
+                    "model": ollama_model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": max_tokens
+                    }
+                }
+            )
+            response.raise_for_status()
+            return response.json()["message"]["content"].strip()
+        except Exception as e:
+            raise Exception(f"Ollama local error: {str(e)}. Make sure Ollama is running.")
+            
+    else:
+        # Use Groq Cloud
+        api_key = os.getenv('GROQ_API_KEY', '').strip()
+        groq_model = os.getenv('GROQ_MODEL', 'llama3-8b-8192').strip()
+        
+        if not api_key:
+            raise Exception("GROQ_API_KEY is not configured in the .env file")
+            
+        client = Groq(api_key=api_key)
+        try:
+            response = client.chat.completions.create(
+                model=groq_model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            raise Exception(f"Groq API error: {str(e)}")
 
 
-def get_ai_model():
-    return os.getenv('OPENAI_MODEL', 'gpt-5.2-chat-latest').strip() or 'gpt-5.2-chat-latest'
-
+# --- Helper Functions ---
 
 def _normalize_context_text(text):
     return ' '.join((text or '').split()).strip()
@@ -108,12 +150,16 @@ def _build_summary_prompt(text):
     )
 
 
+# --- Endpoints ---
+
 @jwt_required()
 def answer_question(app):
     data = request.get_json() or {}
     question = (data.get('message') or data.get('question') or '').strip()
     file_id = data.get('file_id')
     note_id = data.get('note_id')
+    use_local = data.get('use_local', False)
+    
     direct_context = _normalize_context_text(
         data.get('content') or data.get('study_material') or data.get('extracted_text')
     )
@@ -144,25 +190,17 @@ def answer_question(app):
 
     context_text = _combine_context_parts(context_parts)
 
-    client = get_ai_client()
-    if client is None:
-        return resp(False, 'AI service is not configured', status=503)
-
     try:
-        response = client.chat.completions.create(
-            model=get_ai_model(),
-            messages=(
-                _build_contextual_messages(question, context_text)
-                if context_text
-                else _build_general_messages(question)
-            ),
+        messages = _build_contextual_messages(question, context_text) if context_text else _build_general_messages(question)
+        ans = generate_ai_completion(
+            messages=messages,
             max_tokens=400,
-            temperature=0.4 if context_text else 0.7
+            temperature=0.4 if context_text else 0.7,
+            use_local=use_local
         )
-        ans = response.choices[0].message.content.strip()
         return resp(True, 'Answer generated', {'answer': ans})
     except Exception as e:
-        return resp(False, f'AI service error: {str(e)}', status=500)
+        return resp(False, str(e), status=500)
 
 
 @jwt_required()
@@ -171,6 +209,7 @@ def summarize_text(app):
     text = data.get('text', '').strip()
     file_id = data.get('file_id')
     note_id = data.get('note_id')
+    use_local = data.get('use_local', False)
 
     if note_id:
         note_result = _get_note_context(app, note_id)
@@ -191,49 +230,45 @@ def summarize_text(app):
     if not text:
         return resp(False, 'Text, file_id, or note_id is required', status=400)
 
-    client = get_ai_client()
-    if client is None:
-        return resp(False, 'AI service is not configured', status=503)
-
     try:
         prompt = _build_summary_prompt(text)
-        response = client.chat.completions.create(
-            model=get_ai_model(),
-            messages=[
-                {'role': 'system', 'content': 'You are a helpful assistant. Summarize the given text in 3-4 bullet points.'},
-                {'role': 'user', 'content': prompt}
-            ],
+        messages = [
+            {'role': 'system', 'content': 'You are a helpful assistant. Summarize the given text in 3-4 bullet points.'},
+            {'role': 'user', 'content': prompt}
+        ]
+        
+        summary = generate_ai_completion(
+            messages=messages,
             max_tokens=300,
-            temperature=0.7
+            temperature=0.7,
+            use_local=use_local
         )
-        summary = response.choices[0].message.content.strip()
         return resp(True, 'Summary generated', {'summary': summary})
     except Exception as e:
-        return resp(False, f'AI service error: {str(e)}', status=500)
+        return resp(False, str(e), status=500)
 
 
 @jwt_required()
 def generate_quiz(app):
     data = request.get_json() or {}
     topic = data.get('topic', '').strip()
+    use_local = data.get('use_local', False)
+    
     if not topic:
         return resp(False, 'Topic is required', status=400)
 
-    client = get_ai_client()
-    if client is None:
-        return resp(False, 'AI service is not configured', status=503)
-
     try:
-        response = client.chat.completions.create(
-            model=get_ai_model(),
-            messages=[
-                {'role': 'system', 'content': 'You are an educational assistant. Create a 5-question academic quiz with answers for the given topic.'},
-                {'role': 'user', 'content': f'Create a quiz on: {topic}'}
-            ],
+        messages = [
+            {'role': 'system', 'content': 'You are an educational assistant. Create a 5-question academic quiz with answers for the given topic.'},
+            {'role': 'user', 'content': f'Create a quiz on: {topic}'}
+        ]
+        
+        quiz = generate_ai_completion(
+            messages=messages,
             max_tokens=500,
-            temperature=0.6
+            temperature=0.6,
+            use_local=use_local
         )
-        quiz = response.choices[0].message.content.strip()
         return resp(True, 'Quiz generated', {'quiz': quiz})
     except Exception as e:
-        return resp(False, f'AI service error: {str(e)}', status=500)
+        return resp(False, str(e), status=500)
