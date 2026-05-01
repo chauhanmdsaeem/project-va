@@ -10,3 +10,10 @@ python-docx
 pillow
 pytesseract
 gunicorn
+flask-cors
+flask-jwt-extended
+pymongo
+bcrypt
+openai
+groq
+requests
