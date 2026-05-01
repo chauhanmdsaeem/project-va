@@ -86,3 +86,88 @@ function initDarkMode() {
     };
   }
 }
+
+// ==========================================
+// AI Chatbot Logic (Groq / Ollama Llama)
+// ==========================================
+document.addEventListener('DOMContentLoaded', () => {
+  // Initialize dark mode if elements exist on the current page
+  initDarkMode();
+
+  const chatContainer = document.querySelector('.chat-container');
+  if (!chatContainer) return; // Only run chat logic if chat UI exists on the page
+
+  let conversationHistory = [
+      { 
+          role: "system", 
+          content: "You are a helpful, expert academic study assistant. Provide clear, concise, and accurate answers." 
+      }
+  ];
+
+  const sendBtn = document.getElementById('send-btn');
+  const inputField = document.getElementById('chat-input');
+  const toggleLocal = document.getElementById('use-local-toggle');
+
+  if(sendBtn && inputField) {
+      inputField.addEventListener('keypress', (e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              handleSendMessage();
+          }
+      });
+
+      sendBtn.addEventListener('click', handleSendMessage);
+  }
+
+  async function handleSendMessage() {
+      const messageText = inputField.value.trim();
+      if (!messageText) return;
+
+      // Update UI and State
+      addMessageToUI('user', messageText);
+      conversationHistory.push({ role: "user", content: messageText });
+      inputField.value = '';
+      sendBtn.disabled = true;
+
+      const useLocal = toggleLocal ? toggleLocal.checked : false;
+      const loadingId = addMessageToUI('bot', 'Thinking...');
+
+      // Make API Call using the global apiFetch wrapper
+      const data = await apiFetch('/ai/chat', 'POST', {
+          messages: conversationHistory,
+          use_local: useLocal
+      });
+
+      removeMessageFromUI(loadingId);
+      
+      if (data.success !== false) {
+          addMessageToUI('bot', data.response || data.answer);
+          conversationHistory.push({ role: "assistant", content: data.response || data.answer });
+      } else {
+          addMessageToUI('bot', 'Error: ' + (data.message || data.error || 'Failed to get response'));
+      }
+
+      sendBtn.disabled = false;
+      inputField.focus();
+  }
+
+  function addMessageToUI(sender, text) {
+      const chatBox = document.getElementById('chat-messages');
+      if (!chatBox) return;
+
+      const msgDiv = document.createElement('div');
+      const msgId = 'msg-' + Date.now();
+      msgDiv.id = msgId;
+      msgDiv.className = `message ${sender}`;
+      msgDiv.textContent = text; 
+      
+      chatBox.appendChild(msgDiv);
+      chatBox.scrollTop = chatBox.scrollHeight; 
+      return msgId;
+  }
+
+  function removeMessageFromUI(id) {
+      const msg = document.getElementById(id);
+      if (msg) msg.remove();
+  }
+});
